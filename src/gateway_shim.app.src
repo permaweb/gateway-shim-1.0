@@ -1,0 +1,9 @@
+{application, gateway_shim,
+    [
+        {description, "HyperBEAM gateway shim device"},
+        {vsn, "0.1.0"},
+        {registered, []},
+        {applications, [kernel, stdlib, hb]},
+        {env, []},
+        {modules, []}
+    ]}.
