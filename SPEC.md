@@ -67,6 +67,12 @@ Path transforms run in this order:
 
 Route values are loaded through the HyperBEAM cache before use.
 
+Query parameters in a rewritten path are synchronized with the parsed request
+fields. When a route introduces `codec-device=ans104@1.0`, the shim also
+re-decodes a preserved raw HTTP body as a verified ANS-104 item. This is
+necessary because HyperBEAM normally selects the inbound body codec before
+executing request hooks.
+
 ## Result
 
 The device returns `{ok, HookRequest}`.

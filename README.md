@@ -32,6 +32,10 @@ Path transforms run in this order:
 When a route changes the request, the hook also rebuilds the singleton `body`
 from the rewritten request.
 
+Rewritten query parameters are synchronized with the parsed request. If a
+route introduces `codec-device=ans104@1.0`, the shim re-decodes the preserved
+raw body as a verified ANS-104 item before forwarding it downstream.
+
 ## Configuration
 
 Configure the hook on inbound requests:
@@ -100,15 +104,15 @@ repository-local HyperBEAM key.
 ```text
 device publish: gateway-shim@1.0
 
-spec=sCXIdS0deq4Ox3MiEAXVq8snnYou37ZrQ3oM_ydTZF4
+spec=4yczHYcefJIc5l_e9hj3wiv41Zbey_oEMWQpqCIas2E
 
-impl=VlIWWeOOx8X6VlKmsvxn2vD49ZcJh7J5z-128-2KeTo
+impl=9KJV5upD_GA0DzBYwVc0YZCJmzq7r6kiGf3ypsc_iM0
 
 signer=EvuAtMHsi4bPMlacqZMUtXJPy46sGB--zaYDzgYjDUQ
 ```
 
-- [Device specification](https://arweave.net/sCXIdS0deq4Ox3MiEAXVq8snnYou37ZrQ3oM_ydTZF4)
-- [Device implementation](https://arweave.net/VlIWWeOOx8X6VlKmsvxn2vD49ZcJh7J5z-128-2KeTo)
+- [Device specification](https://arweave.net/4yczHYcefJIc5l_e9hj3wiv41Zbey_oEMWQpqCIas2E)
+- [Device implementation](https://arweave.net/9KJV5upD_GA0DzBYwVc0YZCJmzq7r6kiGf3ypsc_iM0)
 - [Standalone `SPEC.md`](https://arweave.net/LWxVM1NkGpLgAS0x81IngYW2rpIJlUCx6q_zX-s-w9Y)
 
 ## Test

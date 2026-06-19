@@ -99,7 +99,116 @@ apply_route(Req, Route, Opts) ->
             ),
             Opts
         ),
-    Req#{ <<"path">> => RoutedPath }.
+    RoutedReq = sync_path_query(Req, RoutedPath, Opts),
+    maybe_redecode_body(Req, RoutedReq, Opts).
+
+%% @doc Keep parsed query fields synchronized with a rewritten path.
+sync_path_query(Req, RoutedPath, Opts) ->
+    OldPath = hb_maps:get(<<"path">>, Req, <<"/">>, Opts),
+    OldQuery = path_query(OldPath),
+    NewQuery = path_query(RoutedPath),
+    WithoutOldQuery =
+        hb_maps:without(
+            hb_maps:keys(OldQuery, Opts),
+            Req,
+            Opts
+        ),
+    hb_maps:merge(
+        WithoutOldQuery#{ <<"path">> => RoutedPath },
+        NewQuery,
+        Opts
+    ).
+
+path_query(Path) ->
+    {ok, _Parts, Query} = hb_singleton:from_path(Path),
+    Query.
+
+%% @doc Re-decode a preserved raw HTTP body when a route introduces a codec.
+%%
+%% HTTP request codecs are normally selected before request hooks execute. If
+%% the shim adds `codec-device=ans104@1.0' to the path, the original body has
+%% already been decoded with the default codec. Re-decode the preserved raw
+%% body so downstream devices receive the same signed message they would have
+%% received had the codec been present on the original URL.
+maybe_redecode_body(OldReq, NewReq, Opts) ->
+    case {request_codec(OldReq, Opts), request_codec(NewReq, Opts)} of
+        {Codec, Codec} ->
+            NewReq;
+        {_, <<"ans104@1.0">>} ->
+            case hb_message:signers(NewReq, Opts) of
+                [] -> redecode_ans104_body(NewReq, Opts);
+                _ -> NewReq
+            end;
+        _ ->
+            NewReq
+    end.
+
+request_codec(Req, Opts) ->
+    case hb_maps:find(<<"codec-device">>, Req, Opts) of
+        {ok, Codec} ->
+            Codec;
+        error ->
+            Path = hb_maps:get(<<"path">>, Req, <<"/">>, Opts),
+            case hb_maps:get(
+                <<"codec-device">>,
+                path_query(Path),
+                undefined,
+                Opts
+            ) of
+                undefined ->
+                    content_type_codec(
+                        hb_maps:get(
+                            <<"content-type">>,
+                            Req,
+                            undefined,
+                            Opts
+                        )
+                    );
+                Codec ->
+                    Codec
+            end
+    end.
+
+content_type_codec(<<"application/ans104", _/binary>>) ->
+    <<"ans104@1.0">>;
+content_type_codec(_) ->
+    undefined.
+
+redecode_ans104_body(Req, Opts) ->
+    case hb_maps:find(<<"body">>, Req, Opts) of
+        {ok, Body} when is_binary(Body) ->
+            try
+                Item = ar_bundles:deserialize(Body),
+                true = ar_bundles:verify_item(Item),
+                Decoded =
+                    hb_message:convert(
+                        Item,
+                        <<"structured@1.0">>,
+                        <<"ans104@1.0">>,
+                        Opts
+                    ),
+                merge_decoded_request(Req, Decoded, Opts)
+            catch
+                Class:Reason ->
+                    erlang:error(
+                        {gateway_shim_codec_decode_failed,
+                            <<"ans104@1.0">>,
+                            Class,
+                            Reason}
+                    )
+            end;
+        _ ->
+            Req
+    end.
+
+merge_decoded_request(Req, Decoded, Opts) ->
+    RoutedPath = hb_maps:get(<<"path">>, Req, <<"/">>, Opts),
+    DecodedPath = hb_maps:get(<<"path">>, Decoded, RoutedPath, Opts),
+    Method = hb_maps:get(<<"method">>, Req, <<"GET">>, Opts),
+    (hb_maps:merge(Req, Decoded, Opts))#{
+        <<"method">> => Method,
+        <<"path">> => DecodedPath
+    }.
 
 route_path(Route, Default, Opts) ->
     hb_cache:ensure_loaded(hb_maps:get(<<"path">>, Route, Default, Opts), Opts).
@@ -235,6 +344,69 @@ global_routes_test() ->
         hb_maps:get(<<"path">>, Req)
     ),
     ?assertEqual(hb_singleton:from(Req, Opts), hb_maps:get(<<"body">>, Res)).
+
+ans104_query_rewrite_redecodes_body_test() ->
+    Opts =
+        #{
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"store">> => [hb_test_utils:test_store()]
+        },
+    Signed =
+        hb_message:commit(
+            #{ <<"body">> => <<"blocks.csv">> },
+            Opts,
+            #{ <<"device">> => <<"ans104@1.0">>, <<"bundle">> => true }
+        ),
+    Encoded =
+        hb_message:convert(
+            Signed,
+            #{ <<"device">> => <<"ans104@1.0">>, <<"bundle">> => true },
+            <<"structured@1.0">>,
+            Opts
+        ),
+    RawBody = ar_bundles:serialize(Encoded),
+    Base =
+        #{
+            <<"routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"^/~bundler@1\\.0/tx">>,
+                        <<"path">> =>
+                            <<"/~bundler@1.0/tx?codec-device=ans104@1.0">>
+                    }
+                ]
+        },
+    RawReq =
+        #{
+            <<"method">> => <<"POST">>,
+            <<"path">> => <<"/~bundler@1.0/tx">>,
+            <<"body">> => RawBody
+        },
+    HookReq =
+        #{
+            <<"request">> => RawReq,
+            <<"body">> => hb_singleton:from(RawReq, Opts)
+        },
+    {ok, Res} = request(Base, HookReq, Opts),
+    Rewritten = hb_maps:get(<<"request">>, Res),
+    ?assertEqual(
+        <<"/~bundler@1.0/tx?codec-device=ans104@1.0">>,
+        hb_maps:get(<<"path">>, Rewritten)
+    ),
+    ?assertEqual(
+        <<"ans104@1.0">>,
+        hb_maps:get(<<"codec-device">>, Rewritten)
+    ),
+    ?assertNotEqual([], hb_message:signers(Rewritten, Opts)),
+    ?assert(hb_message:verify(Rewritten, all, Opts)),
+    RewrittenBody = hb_maps:get(<<"body">>, Res),
+    BundlerReq = lists:last(RewrittenBody),
+    ?assertNotEqual([], hb_message:signers(BundlerReq, Opts)),
+    ?assert(hb_message:verify(BundlerReq, all, Opts)),
+    ?assertEqual(
+        hb_singleton:from(Rewritten, Opts),
+        RewrittenBody
+    ).
 
 upload_location_rewrite_test() ->
     UploadPath = <<"/~bundler@1.0/tx?codec-device=ans104@1.0">>,
