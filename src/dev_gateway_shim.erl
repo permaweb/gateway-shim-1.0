@@ -1,9 +1,9 @@
 %%% @doc A request hook for gateway-style location path rewrites.
 %%%
-%%% `gateway-shim@1.0' is a no-op unless routes are configured. It applies
-%%% the first matching route from an ordered list, allowing node operators to
-%%% express simple gateway rewrites in HyperBEAM options instead of in a
-%%% reverse proxy.
+%%% `gateway-shim@1.0' redirects bare Arweave transaction ID paths to their
+%%% isolated Base32 origins by default. It also applies the first matching
+%%% route from an ordered list, allowing node operators to express simple
+%%% gateway rewrites in HyperBEAM options instead of in a reverse proxy.
 %%%
 %%% Routes can be configured on the hook device with `routes', or globally
 %%% with the `gateway-shim-routes' node option. Local configuration takes
@@ -43,16 +43,158 @@
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% @doc Apply configured inbound path rewrite routes.
+%% @doc Apply the TXID subdomain redirect or configured path rewrite routes.
 request(Base, HookReq, Opts) ->
     ?event(gateway_shim, {request, {base, Base}, {hook_req, HookReq}}),
     case hb_maps:find(<<"request">>, HookReq, Opts) of
         {ok, Req} ->
-            NewReq = rewrite_request(Base, Req, Opts),
-            {ok, update_hook_req(HookReq, Req, NewReq, Opts)};
+            case txid_subdomain_redirect(Base, Req, Opts) of
+                {redirect, URL} -> redirect_response(URL);
+                {bad_request, Reason} -> bad_request_response(Reason);
+                no_redirect ->
+                    NewReq = rewrite_request(Base, Req, Opts),
+                    {ok, update_hook_req(HookReq, Req, NewReq, Opts)}
+            end;
         error ->
             {ok, HookReq}
     end.
+
+%% @doc Redirect a bare TXID path unless the feature is disabled or canonical.
+txid_subdomain_redirect(Base, Req, Opts) ->
+    Enabled = hb_util:bool(
+        option(
+            Base,
+            <<"txid-subdomain-redirect">>,
+            <<"gateway-shim-txid-subdomain-redirect">>,
+            true,
+            Opts
+        )
+    ),
+    ?event(error, {subdomain_redirect, {req, Req}}),
+    Path = hb_maps:get(<<"path">>, Req, <<>>, Opts),
+    Host = hb_maps:get(<<"host">>, Req, <<>>, Opts),
+    case {Enabled, txid(Path)} of
+        {true, {ok, NativeID}} ->
+            B32 = b32_encode(NativeID),
+            case validated_host(Host, B32, Opts) of
+                {ok, canonical} -> no_redirect;
+                {ok, NodeHost, Port} ->
+                    {redirect, b32_url(B32, NodeHost, Port, Path)};
+                {error, Reason} -> {bad_request, Reason}
+            end;
+        _ ->
+            no_redirect
+    end.
+
+%% @doc Validate the request host against the configured public node host.
+validated_host(Host, B32, Opts) ->
+    case {normalize_request_host(Host), configured_node_host(Opts)} of
+        {{ok, RequestHost, Port}, {ok, NodeHost}} ->
+            CanonicalHost = <<B32/binary, ".", NodeHost/binary>>,
+            case RequestHost of
+                NodeHost -> {ok, NodeHost, Port};
+                CanonicalHost -> {ok, canonical};
+                _ -> {error, host_mismatch}
+            end;
+        {_, {error, _}} ->
+            {error, node_host_not_configured};
+        _ ->
+            {error, invalid_host}
+    end.
+
+configured_node_host(Opts) ->
+    normalize_node_host(hb_opts:get(node_host, undefined, Opts)).
+
+normalize_node_host(RawNodeHost) when is_binary(RawNodeHost) ->
+    URI = case binary:match(RawNodeHost, <<"://">>) of
+        nomatch -> <<"//", RawNodeHost/binary>>;
+        _ -> RawNodeHost
+    end,
+    try uri_string:parse(URI) of
+        #{host := Host} when Host =/= <<>> -> normalize_dns_host(Host);
+        _ -> {error, invalid_node_host}
+    catch
+        _:_ -> {error, invalid_node_host}
+    end;
+normalize_node_host(_) ->
+    {error, invalid_node_host}.
+
+normalize_request_host(Host) when is_binary(Host), Host =/= <<>> ->
+    try uri_string:parse(<<"//", Host/binary>>) of
+        URI = #{host := ParsedHost, path := <<>>} when ParsedHost =/= <<>> ->
+            case maps:without([host, port, path], URI) of
+                Remaining when map_size(Remaining) =:= 0 ->
+                    case normalize_dns_host(ParsedHost) of
+                        {ok, NormalizedHost} ->
+                            {ok, NormalizedHost, maps:get(port, URI, undefined)};
+                        Error -> Error
+                    end;
+                _ ->
+                    {error, invalid_host}
+            end;
+        _ ->
+            {error, invalid_host}
+    catch
+        _:_ -> {error, invalid_host}
+    end;
+normalize_request_host(_) ->
+    {error, invalid_host}.
+
+normalize_dns_host(Host) ->
+    LowerHost = string:lowercase(Host),
+    case binary:last(LowerHost) of
+        $. when byte_size(LowerHost) > 1 ->
+            {ok, binary:part(LowerHost, 0, byte_size(LowerHost) - 1)};
+        _ ->
+            {ok, LowerHost}
+    end.
+
+%% @doc Return the native ID only for a canonical, bare TXID path.
+txid(<<"/", ID:43/binary>>) ->
+    case hb_util:safe_decode(ID) of
+        {ok, NativeID} when byte_size(NativeID) =:= 32 ->
+            case hb_util:encode(NativeID) of
+                ID -> {ok, NativeID};
+                _ -> error
+            end;
+        _ -> error
+    end;
+txid(_) -> error.
+
+%% @doc Base32-encode a native transaction ID as a DNS-safe label.
+b32_encode(NativeID) ->
+    hb_util:bin(
+        string:replace(
+            string:to_lower(hb_util:list(base32:encode(NativeID))),
+            "=", "", all
+        )
+    ).
+
+%% @doc Build a protocol-relative redirect URL, retaining the request port.
+b32_url(B32, Host, Port, Path) ->
+    Authority = case Port of
+        undefined -> Host;
+        _ -> <<Host/binary, ":", (integer_to_binary(Port))/binary>>
+    end,
+    <<"//", B32/binary, ".", Authority/binary, Path/binary>>.
+
+%% @doc Return the canonical-origin redirect as an HTTP response.
+redirect_response(URL) ->
+    ?event(gateway_shim, {txid_subdomain_redirect, {url, URL}}),
+    {error, #{
+        <<"status">> => 302,
+        <<"location">> => URL,
+        <<"body">> =>
+            <<"Redirecting to canonical transaction subdomain: ", URL/binary>>
+    }}.
+
+%% @doc Reject a bare TXID request whose host is not the configured node host.
+bad_request_response(Reason) ->
+    ?event(gateway_shim, {txid_subdomain_redirect_rejected, {reason, Reason}}),
+    {error, #{
+        <<"status">> => 400,
+        <<"body">> => <<"Request host does not match the configured node-host.">>
+    }}.
 
 %% @doc Apply the first matching inbound rewrite route, if one is configured.
 rewrite_request(Base, Req, Opts) ->
@@ -290,6 +432,132 @@ maybe_list(Item, _Opts) ->
     [Item].
 
 %%% Tests
+
+bare_txid_subdomain_redirect_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, <<"hb.example">>),
+    ?assertMatch(
+        {error, #{
+            <<"status">> := 302,
+            <<"location">> :=
+                <<"//222pf3qefyv5ssoj3ffkqijbwrrotwlfq34ghk2wrzexmifgnmnq.hb.example/",
+                    ID/binary>>
+        }},
+        request(#{}, HookReq, txid_opts())
+    ).
+
+txid_subdomain_redirect_preserves_request_port_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, <<"hb.example:8734">>),
+    ?assertMatch(
+        {error, #{
+            <<"status">> := 302,
+            <<"location">> :=
+                <<"//222pf3qefyv5ssoj3ffkqijbwrrotwlfq34ghk2wrzexmifgnmnq.hb.example:8734/",
+                    ID/binary>>
+        }},
+        request(#{}, HookReq, (txid_opts())#{ <<"port">> => 9999 })
+    ).
+
+txid_subdomain_redirect_toggle_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, <<"hb.example">>),
+    ?assertEqual(
+        {ok, HookReq},
+        request(#{ <<"txid-subdomain-redirect">> => false }, HookReq, #{})
+    ),
+    ?assertEqual(
+        {ok, HookReq},
+        request(
+            #{},
+            HookReq,
+            #{ <<"gateway-shim-txid-subdomain-redirect">> => false }
+        )
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 302 }},
+        request(
+            #{ <<"txid-subdomain-redirect">> => true },
+            HookReq,
+            (txid_opts())#{
+                <<"gateway-shim-txid-subdomain-redirect">> => false
+            }
+        )
+    ).
+
+txid_subdomain_redirect_host_mismatch_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, <<"attacker.example">>),
+    ?assertEqual(
+        {error, #{
+            <<"status">> => 400,
+            <<"body">> =>
+                <<"Request host does not match the configured node-host.">>
+        }},
+        request(#{}, HookReq, txid_opts())
+    ).
+
+txid_subdomain_redirect_requires_node_host_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, <<"hb.example">>),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        request(#{}, HookReq, #{ <<"only">> => local })
+    ).
+
+txid_subdomain_redirect_normalizes_node_host_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, <<"HB.EXAMPLE.">>),
+    ?assertMatch(
+        {error, #{
+            <<"status">> := 302,
+            <<"location">> :=
+                <<"//222pf3qefyv5ssoj3ffkqijbwrrotwlfq34ghk2wrzexmifgnmnq.hb.example/",
+                    _/binary>>
+        }},
+        request(
+            #{},
+            HookReq,
+            #{ <<"only">> => local, <<"node-host">> => <<"https://hb.example">> }
+        )
+    ).
+
+non_bare_txid_paths_are_unchanged_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    lists:foreach(
+        fun(Path) ->
+            HookReq = txid_hook_request(Path, <<"hb.example">>),
+            ?assertEqual({ok, HookReq}, request(#{}, HookReq, #{}))
+        end,
+        [
+            <<"/raw/", ID/binary>>,
+            <<"/", ID/binary, "/asset.png">>,
+            <<"/~arweave@2.9/raw=", ID/binary>>
+        ]
+    ).
+
+canonical_txid_subdomain_is_unchanged_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    Host =
+        <<"222pf3qefyv5ssoj3ffkqijbwrrotwlfq34ghk2wrzexmifgnmnq.hb.example">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, Host),
+    ?assertEqual({ok, HookReq}, request(#{}, HookReq, txid_opts())).
+
+canonical_txid_subdomain_with_port_is_unchanged_test() ->
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    Host =
+        <<"222pf3qefyv5ssoj3ffkqijbwrrotwlfq34ghk2wrzexmifgnmnq.hb.example:8734">>,
+    HookReq = txid_hook_request(<<"/", ID/binary>>, Host),
+    ?assertEqual({ok, HookReq}, request(#{}, HookReq, txid_opts())).
+
+txid_opts() ->
+    #{ <<"only">> => local, <<"node-host">> => <<"hb.example">> }.
+
+txid_hook_request(Path, Host) ->
+    #{
+        <<"request">> => #{ <<"path">> => Path, <<"host">> => Host },
+        <<"body">> => []
+    }.
 
 rewrite_route_test() ->
     Base =

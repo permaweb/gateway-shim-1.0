@@ -1,7 +1,8 @@
 # `gateway-shim@1.0`
 
-`gateway-shim@1.0` is a HyperBEAM inbound request hook that performs
-gateway-style path rewrites before a request is resolved.
+`gateway-shim@1.0` is a HyperBEAM inbound request hook that redirects bare
+Arweave transaction IDs to isolated origins and performs gateway-style path
+rewrites before a request is resolved.
 
 ## Request
 
@@ -15,8 +16,27 @@ The hook request is expected to contain:
 }
 ```
 
-If `request` is absent or no route matches, the hook returns the hook request
-without modification.
+If `request` is absent, the hook returns the hook request without modification.
+
+When the request path contains only a canonical 43-character Arweave
+transaction ID and a host is present, the hook returns an HTTP 302 response to
+`<base32-txid>.<node-host>`. The path is retained. Requests already using that
+52-character Base32 subdomain are not redirected.
+
+Before redirecting, the request host is compared case-insensitively with the
+hostname in the `node-host` option. The exact TXID-specific Base32 subdomain is
+also accepted as canonical. A missing, malformed, or mismatched `node-host`
+returns HTTP 400. Redirect locations are built from this trusted hostname
+rather than directly from the request host. If the request host contains a
+port, it is validated separately from the hostname and retained in the
+redirect location.
+
+The redirect is enabled by default. It can be configured locally through
+`txid-subdomain-redirect` or globally through
+`gateway-shim-txid-subdomain-redirect`; local configuration takes precedence.
+Setting the applicable value to `false` disables it. Paths such as
+`/raw/TXID`, `/TXID/asset`, and device invocations are not redirected and
+continue through the existing route logic.
 
 ## Configuration
 
@@ -30,11 +50,13 @@ the first matching route is applied.
 
 ```erlang
 #{
+    <<"node-host">> => <<"hb.example">>,
     <<"on">> =>
         #{
             <<"request">> =>
                 #{
                     <<"device">> => <<"gateway-shim@1.0">>,
+                    <<"txid-subdomain-redirect">> => true,
                     <<"routes">> => Routes
                 }
         }
@@ -75,7 +97,9 @@ executing request hooks.
 
 ## Result
 
-The device returns `{ok, HookRequest}`.
+The device normally returns `{ok, HookRequest}`. A qualifying bare TXID path
+returns `{error, Response}`, where `Response` has status 302 and a `location`
+pointing to the canonical Base32 subdomain.
 
 When a route changes the request path, the result contains the rewritten
 request and a singleton body rebuilt with `hb_singleton:from/2`:

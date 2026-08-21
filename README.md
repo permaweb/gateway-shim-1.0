@@ -4,9 +4,22 @@ This repository contains the HyperBEAM package for `gateway-shim@1.0`.
 
 ## Behavior
 
-`gateway-shim@1.0` is an inbound request hook for gateway-style path rewrites.
-It does nothing unless routes are configured. When multiple routes are
-configured, it applies only the first matching route.
+`gateway-shim@1.0` is an inbound request hook for gateway-style behavior. By
+default, a path containing only an Arweave transaction ID redirects to the
+transaction's isolated 52-character Base32 subdomain. Other paths retain their
+existing behavior. When multiple rewrite routes are configured, the shim
+applies only the first matching route.
+
+The TXID subdomain redirect can be configured locally through
+`txid-subdomain-redirect` or globally through
+`gateway-shim-txid-subdomain-redirect`. Local configuration takes precedence
+and the default is `true`.
+
+For bare TXID redirects, the request host must match the configured `node-host`.
+The exact TXID-specific Base32 subdomain is also accepted after redirecting.
+Missing, malformed, or mismatched host configuration returns HTTP 400.
+If the request host contains a port, redirects retain it after validating the
+hostname.
 
 Routes can be configured locally on the hook device through `routes` or
 globally through the `gateway-shim-routes` node option. Local configuration
@@ -42,11 +55,13 @@ Configure the hook on inbound requests:
 
 ```erlang
 #{
+    <<"node-host">> => <<"hb.example">>,
     <<"on">> =>
         #{
             <<"request">> =>
                 #{
                     <<"device">> => <<"gateway-shim@1.0">>,
+                    <<"txid-subdomain-redirect">> => true,
                     <<"routes">> =>
                         [
                             #{
@@ -61,6 +76,10 @@ Configure the hook on inbound requests:
 ```
 
 This rewrites `/_hb/~meta@1.0/info` to `/~meta@1.0/info`.
+
+Set `<<"txid-subdomain-redirect">> => false` on the hook device to disable
+canonical subdomain redirects. Alternatively, set the node option
+`<<"gateway-shim-txid-subdomain-redirect">> => false`.
 
 The following gateway configuration preserves existing bundler routes and
 rewrites every other path to the ANS-104 upload endpoint:
