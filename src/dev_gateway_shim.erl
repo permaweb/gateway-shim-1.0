@@ -45,7 +45,7 @@
 
 %% @doc Apply the TXID subdomain redirect or configured path rewrite routes.
 request(Base, HookReq, Opts) ->
-    ?event(gateway_shim, {request, {base, Base}, {hook_req, HookReq}}),
+    ?event(debug_gateway_shim, {request, {base, Base}, {hook_req, HookReq}}),
     case hb_maps:find(<<"request">>, HookReq, Opts) of
         {ok, Req} ->
             case txid_subdomain_redirect(Base, Req, Opts) of
@@ -70,17 +70,18 @@ txid_subdomain_redirect(Base, Req, Opts) ->
             Opts
         )
     ),
-    ?event(error, {subdomain_redirect, {req, Req}}),
     Path = hb_maps:get(<<"path">>, Req, <<>>, Opts),
     Host = hb_maps:get(<<"host">>, Req, <<>>, Opts),
     case {Enabled, txid(Path)} of
         {true, {ok, NativeID}} ->
             B32 = b32_encode(NativeID),
             case validated_host(Host, B32, Opts) of
-                {ok, canonical} -> no_redirect;
+                {ok, canonical} ->
+                    no_redirect;
                 {ok, NodeHost, Port} ->
                     {redirect, b32_url(B32, NodeHost, Port, Path)};
-                {error, Reason} -> {bad_request, Reason}
+                {error, Reason} ->
+                    {bad_request, Reason}
             end;
         _ ->
             no_redirect
@@ -180,7 +181,7 @@ b32_url(B32, Host, Port, Path) ->
 
 %% @doc Return the canonical-origin redirect as an HTTP response.
 redirect_response(URL) ->
-    ?event(gateway_shim, {txid_subdomain_redirect, {url, URL}}),
+    ?event(debug_gateway_shim, {txid_subdomain_redirect, {url, URL}}),
     {error, #{
         <<"status">> => 302,
         <<"location">> => URL,
@@ -190,7 +191,7 @@ redirect_response(URL) ->
 
 %% @doc Reject a bare TXID request whose host is not the configured node host.
 bad_request_response(Reason) ->
-    ?event(gateway_shim, {txid_subdomain_redirect_rejected, {reason, Reason}}),
+    ?event(debug_gateway_shim, {txid_subdomain_redirect_rejected, {reason, Reason}}),
     {error, #{
         <<"status">> => 400,
         <<"body">> => <<"Request host does not match the configured node-host.">>
@@ -208,7 +209,7 @@ rewrite(Req, [Route | Rest], Opts) ->
         true ->
             NewReq = apply_route(Req, Route, Opts),
             ?event(
-                gateway_shim,
+                debug_gateway_shim,
                 {
                     rewritten,
                     {template, Template},
@@ -372,12 +373,17 @@ apply_path_prefix(Route, Path, Opts) ->
 apply_path_replace(Route, Path, Opts) ->
     case {hb_maps:find(<<"match">>, Route, Opts), hb_maps:find(<<"with">>, Route, Opts)} of
         {{ok, Match}, {ok, With}} ->
-            re:replace(
+            FinalPath = re:replace(
                 Path,
                 hb_cache:ensure_loaded(Match, Opts),
                 hb_cache:ensure_loaded(With, Opts),
                 [global, {return, binary}]
-            );
+            ),
+            ?event(debug_gateway_shim,
+                {path_replace,
+                    {path, Path},
+                    {to_path, FinalPath}}),
+            FinalPath;
         _ -> Path
     end.
 
