@@ -46,7 +46,11 @@ Routes can be configured in either of the following ways:
 - Globally, through the `gateway-shim-routes` node option.
 
 Local configuration takes precedence. Routes are evaluated in order, and only
-the first matching route is applied.
+the first matching route is applied. Global `gateway-shim-routes` are eligible
+only when the normalized request host exactly matches `node-host`. Requests to
+subdomains bypass global routes. Ports, hostname case, and a trailing DNS dot
+do not affect the comparison. Local `routes` are not restricted by the request
+host.
 
 ```erlang
 #{
@@ -132,8 +136,12 @@ This rewrites `/_hb/~meta@1.0/info` to `/~meta@1.0/info`.
 
 ## Example: Gateway Upload Endpoint
 
+This global configuration applies on `hb.example` and is bypassed for its
+subdomains:
+
 ```erlang
 #{
+    <<"node-host">> => <<"hb.example">>,
     <<"gateway-shim-routes">> =>
         [
             #{ <<"template">> => <<"^/~bundler@1\\.0/tx">> },

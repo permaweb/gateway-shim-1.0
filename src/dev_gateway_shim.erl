@@ -199,7 +199,7 @@ bad_request_response(Reason) ->
 
 %% @doc Apply the first matching inbound rewrite route, if one is configured.
 rewrite_request(Base, Req, Opts) ->
-    rewrite(Req, routes(Base, Opts), Opts).
+    rewrite(Req, routes(Base, Req, Opts), Opts).
 
 rewrite(Req, [], _Opts) ->
     Req;
@@ -417,8 +417,28 @@ strip_prefix(Path, Prefix) ->
             Path
     end.
 
-routes(Base, Opts) ->
-    maybe_list(option(Base, <<"routes">>, <<"gateway-shim-routes">>, [], Opts), Opts).
+routes(Base, Req, Opts) ->
+    case hb_maps:find(<<"routes">>, Base, Opts) of
+        {ok, LocalRoutes} ->
+            maybe_list(LocalRoutes, Opts);
+        error ->
+            case request_is_on_node_host(Req, Opts) of
+                true ->
+                    maybe_list(
+                        hb_opts:get(<<"gateway-shim-routes">>, [], Opts),
+                        Opts
+                    );
+                false ->
+                    []
+            end
+    end.
+
+request_is_on_node_host(Req, Opts) ->
+    Host = hb_maps:get(<<"host">>, Req, <<>>, Opts),
+    case {normalize_request_host(Host), configured_node_host(Opts)} of
+        {{ok, NodeHost, _Port}, {ok, NodeHost}} -> true;
+        _ -> false
+    end.
 
 option(Base, LocalKey, GlobalKey, Default, Opts) ->
     hb_maps:get(LocalKey, Base, hb_opts:get(GlobalKey, Default, Opts), Opts).
@@ -597,12 +617,14 @@ global_routes_test() ->
             <<"request">> =>
                 #{
                     <<"method">> => <<"GET">>,
-                    <<"path">> => <<"/upload">>
+                    <<"path">> => <<"/upload">>,
+                    <<"host">> => <<"hb.example:8734">>
                 },
             <<"body">> => []
         },
     Opts =
         #{
+            <<"node-host">> => <<"hb.example">>,
             <<"gateway-shim-routes">> =>
                 [
                     #{
@@ -618,6 +640,56 @@ global_routes_test() ->
         hb_maps:get(<<"path">>, Req)
     ),
     ?assertEqual(hb_singleton:from(Req, Opts), hb_maps:get(<<"body">>, Res)).
+
+global_routes_skip_subdomains_test() ->
+    Req =
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<"/upload">>,
+            <<"host">> => <<"transaction.hb.example">>
+        },
+    HookReq =
+        #{
+            <<"request">> => Req,
+            <<"body">> => []
+        },
+    Opts =
+        #{
+            <<"node-host">> => <<"hb.example">>,
+            <<"gateway-shim-routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"^/upload">>,
+                        <<"path">> => <<"/~bundler@1.0/tx">>
+                    }
+                ]
+        },
+    ?assertEqual({ok, HookReq}, request(#{}, HookReq, Opts)).
+
+local_routes_apply_on_subdomains_test() ->
+    Base =
+        #{
+            <<"routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"^/upload">>,
+                        <<"path">> => <<"/~bundler@1.0/tx">>
+                    }
+                ]
+        },
+    HookReq =
+        #{
+            <<"request">> =>
+                #{
+                    <<"method">> => <<"GET">>,
+                    <<"path">> => <<"/upload">>,
+                    <<"host">> => <<"transaction.hb.example">>
+                },
+            <<"body">> => []
+        },
+    {ok, Res} = request(Base, HookReq, #{}),
+    Req = hb_maps:get(<<"request">>, Res),
+    ?assertEqual(<<"/~bundler@1.0/tx">>, hb_maps:get(<<"path">>, Req)).
 
 ans104_query_rewrite_redecodes_body_test() ->
     Opts =

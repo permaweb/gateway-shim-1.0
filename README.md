@@ -23,7 +23,10 @@ hostname.
 
 Routes can be configured locally on the hook device through `routes` or
 globally through the `gateway-shim-routes` node option. Local configuration
-takes precedence.
+takes precedence. Global routes are applied only when the normalized request
+host exactly matches `node-host`; requests to subdomains bypass them. Ports,
+hostname case, and a trailing DNS dot do not affect this comparison. Local
+routes are not restricted by the request host.
 
 Each route supports:
 
@@ -82,10 +85,12 @@ canonical subdomain redirects. Alternatively, set the node option
 `<<"gateway-shim-txid-subdomain-redirect">> => false`.
 
 The following gateway configuration preserves existing bundler routes and
-rewrites every other path to the ANS-104 upload endpoint:
+rewrites every other path on `hb.example` to the ANS-104 upload endpoint.
+Requests to subdomains of `hb.example` bypass these global routes:
 
 ```erlang
 #{
+    <<"node-host">> => <<"hb.example">>,
     <<"gateway-shim-routes">> =>
         [
             #{ <<"template">> => <<"^/~bundler@1\\.0/tx">> },
