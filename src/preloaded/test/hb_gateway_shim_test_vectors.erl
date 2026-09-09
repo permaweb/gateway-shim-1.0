@@ -6,6 +6,7 @@ opts() ->
     hb:init(),
     #{
         <<"load-remote-devices">> => false,
+        <<"node-host">> => <<"hb.example">>,
         <<"priv-wallet">> => ar_wallet:new(),
         <<"store">> => [hb_test_utils:test_store()]
     }.
@@ -26,6 +27,26 @@ request(Path) ->
             },
         <<"body">> => []
     }.
+
+packaged_txid_subdomain_redirect_vector_test() ->
+    Opts = opts(),
+    ID = <<"1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
+    Req = (request(<<"/", ID/binary>>))#{
+        <<"request">> => #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<"/", ID/binary>>,
+            <<"host">> => <<"hb.example:8734">>
+        }
+    },
+    ?assertMatch(
+        {error, #{
+            <<"status">> := 302,
+            <<"location">> :=
+                <<"//222pf3qefyv5ssoj3ffkqijbwrrotwlfq34ghk2wrzexmifgnmnq.hb.example:8734/",
+                    ID/binary>>
+        }},
+        hb_ao:resolve(base([]), Req, Opts)
+    ).
 
 packaged_path_rewrite_vector_test() ->
     Opts = opts(),
